@@ -5,6 +5,7 @@ import (
 	"io"
 	"log"
 	"net/http"
+	"strings"
 
 	"github.com/giridhara123/pipeline-copilot/internal/events"
 	"github.com/giridhara123/pipeline-copilot/internal/provider"
@@ -36,17 +37,11 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 	defer r.Body.Close()
 
-	// Collect headers into a flat map for the provider.
+	// Store headers in lowercase so provider lookups are case-insensitive.
 	headers := make(map[string]string, len(r.Header))
 	for k, v := range r.Header {
 		if len(v) > 0 {
-			headers[http.CanonicalHeaderKey(k)] = v[0]
-		}
-	}
-	// Also add lowercase versions so provider code can use either.
-	for k, v := range r.Header {
-		if len(v) > 0 {
-			headers[k] = v[0]
+			headers[strings.ToLower(k)] = v[0]
 		}
 	}
 
@@ -66,6 +61,6 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 	log.Printf("webhook: received %s from %s/%s", evt.Type, evt.Provider, evt.Repo)
 
-	// Handle in a goroutine so we never block the HTTP response.
-	go s.handler(r.Context(), evt)
+	// Use context.Background() — r.Context() is cancelled once we send 200.
+	go s.handler(context.Background(), evt)
 }

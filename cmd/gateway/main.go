@@ -121,8 +121,9 @@ func handlePipelineFailed(ctx context.Context, evt events.CanonicalEvent, p prov
 	log.Printf("diagnosing failure: run=%s repo=%s", payload.RunID, evt.Repo)
 
 	// Post an immediate "investigating" placeholder.
+	// Capture channelID from the response — chat.update requires the ID, not the name.
 	placeholderText := fmt.Sprintf(":hourglass: *Investigating pipeline failure* in `%s` — `%s` on `%s`...", evt.Repo, payload.WorkflowName, payload.Branch)
-	_, ts, err := api.PostMessageContext(ctx, cfg.slackChannel, slack.MsgOptionText(placeholderText, false))
+	channelID, ts, err := api.PostMessageContext(ctx, cfg.slackChannel, slack.MsgOptionText(placeholderText, false))
 	if err != nil {
 		log.Printf("slack placeholder post error: %v", err)
 	}
@@ -132,7 +133,7 @@ func handlePipelineFailed(ctx context.Context, evt events.CanonicalEvent, p prov
 	rawLog, err := p.FetchLogs(ctx, runRef)
 	if err != nil {
 		log.Printf("fetch logs error: %v", err)
-		updateSlackMessage(ctx, api, cfg.slackChannel, ts,
+		updateSlackMessage(ctx, api, channelID, ts,
 			fmt.Sprintf(":red_circle: *Pipeline Failed* — `%s`\nCould not fetch logs: %v\n<%s|View Run>", payload.WorkflowName, err, payload.RunURL))
 		return
 	}
@@ -149,14 +150,14 @@ func handlePipelineFailed(ctx context.Context, evt events.CanonicalEvent, p prov
 	})
 	if err != nil {
 		log.Printf("diagnosis error: %v", err)
-		updateSlackMessage(ctx, api, cfg.slackChannel, ts,
+		updateSlackMessage(ctx, api, channelID, ts,
 			fmt.Sprintf(":red_circle: *Pipeline Failed* — `%s`\nDiagnosis unavailable.\n<%s|View Run>", payload.WorkflowName, payload.RunURL))
 		return
 	}
 
 	// Build a Block Kit diagnosis card and update the placeholder.
 	blocks := buildDiagnosisCard(evt, payload, result)
-	_, _, _, err = api.UpdateMessageContext(ctx, cfg.slackChannel, ts, slack.MsgOptionBlocks(blocks...))
+	_, _, _, err = api.UpdateMessageContext(ctx, channelID, ts, slack.MsgOptionBlocks(blocks...))
 	if err != nil {
 		log.Printf("slack update error: %v", err)
 	}
