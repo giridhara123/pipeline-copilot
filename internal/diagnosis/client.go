@@ -66,3 +66,36 @@ func (c *Client) Diagnose(ctx context.Context, req Request) (Result, error) {
 	}
 	return result, nil
 }
+
+// Embed generates a vector embedding for the given text by calling the AI service.
+// The returned slice has 1536 dimensions, suitable for pgvector storage.
+func (c *Client) Embed(ctx context.Context, text string) ([]float32, error) {
+	body, err := json.Marshal(map[string]string{"text": text})
+	if err != nil {
+		return nil, err
+	}
+
+	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, c.baseURL+"/embed", bytes.NewReader(body))
+	if err != nil {
+		return nil, err
+	}
+	httpReq.Header.Set("Content-Type", "application/json")
+
+	resp, err := c.httpClient.Do(httpReq)
+	if err != nil {
+		return nil, fmt.Errorf("embed: request failed: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("embed: service returned %d", resp.StatusCode)
+	}
+
+	var result struct {
+		Embedding []float32 `json:"embedding"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+		return nil, fmt.Errorf("embed: failed to decode response: %w", err)
+	}
+	return result.Embedding, nil
+}

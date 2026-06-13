@@ -1,12 +1,16 @@
 package github
 
 import (
+	"archive/zip"
+	"bytes"
 	"context"
 	"crypto/hmac"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"io"
+	"net/http"
 	"strings"
 	"time"
 
@@ -153,22 +157,81 @@ func (p *Provider) parsePullRequest(body []byte) (events.CanonicalEvent, error) 
 	}, nil
 }
 
-// Read operations — Phase 1 will fill these in with real GitHub API calls.
-
+// FetchLogs downloads the zip of logs for a workflow run and returns the text content.
+// GitHub returns logs as a zip archive; we extract and concatenate all log files.
 func (p *Provider) FetchLogs(ctx context.Context, runID string) (provider.RawLog, error) {
-	return provider.RawLog{}, fmt.Errorf("github: FetchLogs not yet implemented — coming in Phase 1")
+	// Step 1: get the redirect URL for the log zip.
+	parts := strings.SplitN(runID, "/", 3) // "owner/repo/runid"
+	if len(parts) != 3 {
+		return provider.RawLog{}, fmt.Errorf("github: runID must be owner/repo/runid, got %q", runID)
+	}
+	owner, repo, id := parts[0], parts[1], parts[2]
+
+	url := fmt.Sprintf("https://api.github.com/repos/%s/%s/actions/runs/%s/logs", owner, repo, id)
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+	if err != nil {
+		return provider.RawLog{}, err
+	}
+	req.Header.Set("Authorization", "Bearer "+p.token)
+	req.Header.Set("Accept", "application/vnd.github+json")
+
+	// Use a client that follows redirects.
+	client := &http.Client{}
+	resp, err := client.Do(req)
+	if err != nil {
+		return provider.RawLog{}, fmt.Errorf("github: log request failed: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return provider.RawLog{}, fmt.Errorf("github: log fetch returned %d", resp.StatusCode)
+	}
+
+	zipData, err := io.ReadAll(io.LimitReader(resp.Body, 50<<20)) // 50 MB cap
+	if err != nil {
+		return provider.RawLog{}, fmt.Errorf("github: reading log zip: %w", err)
+	}
+
+	// Step 2: unzip and concatenate log files.
+	zr, err := zip.NewReader(bytes.NewReader(zipData), int64(len(zipData)))
+	if err != nil {
+		return provider.RawLog{}, fmt.Errorf("github: unzipping logs: %w", err)
+	}
+
+	var sb strings.Builder
+	for _, f := range zr.File {
+		if !strings.HasSuffix(f.Name, ".txt") {
+			continue
+		}
+		rc, err := f.Open()
+		if err != nil {
+			continue
+		}
+		content, _ := io.ReadAll(io.LimitReader(rc, 2<<20)) // 2 MB per file
+		rc.Close()
+		sb.WriteString(fmt.Sprintf("\n=== %s ===\n", f.Name))
+		sb.Write(content)
+	}
+
+	runURL := fmt.Sprintf("https://github.com/%s/%s/actions/runs/%s", owner, repo, id)
+	return provider.RawLog{
+		Content: sb.String(),
+		RunID:   runID,
+		RunURL:  runURL,
+	}, nil
 }
 
 func (p *Provider) FetchDiff(ctx context.Context, prNumber int, repo string) (provider.Diff, error) {
-	return provider.Diff{}, fmt.Errorf("github: FetchDiff not yet implemented — coming in Phase 1")
+	return provider.Diff{}, fmt.Errorf("github: FetchDiff not yet implemented — coming in Phase 3")
 }
 
 func (p *Provider) ListRecentCommits(ctx context.Context, repo, branch string, limit int) ([]provider.Commit, error) {
-	return nil, fmt.Errorf("github: ListRecentCommits not yet implemented — coming in Phase 1")
+	return nil, fmt.Errorf("github: ListRecentCommits not yet implemented — coming in Phase 4")
 }
 
 func (p *Provider) GetDeploymentStatus(ctx context.Context, deployID, repo string) (provider.DeployStatus, error) {
-	return provider.DeployStatus{}, fmt.Errorf("github: GetDeploymentStatus not yet implemented — coming in Phase 1")
+	return provider.DeployStatus{}, fmt.Errorf("github: GetDeploymentStatus not yet implemented — coming in Phase 4")
 }
 
 // Write operations — Phase 5 will fill these in.

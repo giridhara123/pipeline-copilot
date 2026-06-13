@@ -7,7 +7,10 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"regexp"
+	"strings"
 	"syscall"
+	"time"
 
 	"github.com/joho/godotenv"
 	"github.com/slack-go/slack"
@@ -18,6 +21,8 @@ import (
 	fakeprovider "github.com/giridhara123/pipeline-copilot/internal/provider/fake"
 	githubprovider "github.com/giridhara123/pipeline-copilot/internal/provider/github"
 	"github.com/giridhara123/pipeline-copilot/internal/provider"
+	"github.com/giridhara123/pipeline-copilot/internal/store"
+	pgstore "github.com/giridhara123/pipeline-copilot/internal/store/postgres"
 	"github.com/giridhara123/pipeline-copilot/internal/webhook"
 )
 
@@ -37,14 +42,22 @@ func main() {
 
 	ai := diagnosis.NewClient(cfg.aiServiceURL)
 
+	// Connect to PostgreSQL.
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	db, err := pgstore.New(ctx, cfg.databaseURL)
+	if err != nil {
+		log.Fatalf("store: %v", err)
+	}
+	defer db.Close()
+	log.Println("store: connected to PostgreSQL")
+
 	api := slack.New(
 		cfg.slackBotToken,
 		slack.OptionAppLevelToken(cfg.slackAppToken),
 	)
 	client := socketmode.New(api)
-
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
 
 	ready := make(chan struct{})
 
@@ -56,17 +69,15 @@ func main() {
 		cancel()
 	}()
 
-	// eventHandler is called for every valid canonical event from any source.
 	eventHandler := func(ctx context.Context, evt events.CanonicalEvent) {
 		switch evt.Type {
 		case events.EventPipelineFailed:
-			handlePipelineFailed(ctx, evt, p, ai, api, cfg)
+			handlePipelineFailed(ctx, evt, p, ai, db, api, cfg)
 		default:
 			log.Printf("unhandled event type: %s", evt.Type)
 		}
 	}
 
-	// HTTP server for GitHub webhooks.
 	webhookServer := webhook.NewServer(p, eventHandler)
 	go func() {
 		log.Printf("webhook server listening on :%s", cfg.webhookPort)
@@ -75,7 +86,6 @@ func main() {
 		}
 	}()
 
-	// Slack Socket Mode event loop.
 	go func() {
 		for {
 			select {
@@ -89,7 +99,6 @@ func main() {
 
 	log.Println("PipelineCopilot gateway starting...")
 
-	// In fake mode, fire a synthetic failure after Slack is ready.
 	if cfg.provider != "github" {
 		go func() {
 			select {
@@ -112,7 +121,7 @@ func main() {
 	}
 }
 
-func handlePipelineFailed(ctx context.Context, evt events.CanonicalEvent, p provider.Provider, ai *diagnosis.Client, api *slack.Client, cfg config) {
+func handlePipelineFailed(ctx context.Context, evt events.CanonicalEvent, p provider.Provider, ai *diagnosis.Client, db store.Store, api *slack.Client, cfg config) {
 	payload, ok := evt.Payload.(events.PipelineFailedPayload)
 	if !ok {
 		return
@@ -120,15 +129,12 @@ func handlePipelineFailed(ctx context.Context, evt events.CanonicalEvent, p prov
 
 	log.Printf("diagnosing failure: run=%s repo=%s", payload.RunID, evt.Repo)
 
-	// Post an immediate "investigating" placeholder.
-	// Capture channelID from the response — chat.update requires the ID, not the name.
 	placeholderText := fmt.Sprintf(":hourglass: *Investigating pipeline failure* in `%s` — `%s` on `%s`...", evt.Repo, payload.WorkflowName, payload.Branch)
 	channelID, ts, err := api.PostMessageContext(ctx, cfg.slackChannel, slack.MsgOptionText(placeholderText, false))
 	if err != nil {
 		log.Printf("slack placeholder post error: %v", err)
 	}
 
-	// Fetch logs from the provider.
 	runRef := evt.Repo + "/" + payload.RunID
 	rawLog, err := p.FetchLogs(ctx, runRef)
 	if err != nil {
@@ -138,7 +144,50 @@ func handlePipelineFailed(ctx context.Context, evt events.CanonicalEvent, p prov
 		return
 	}
 
-	// Call the AI service.
+	// Step 1: embed the timestamp-stripped log to query for similar past failures.
+	// The sentence-transformers model understands semantic meaning, so similar
+	// error messages get similar vectors even if wording differs slightly.
+	logText := stripTimestamps(rawLog.Content)
+	if len(logText) > 4000 {
+		logText = logText[len(logText)-4000:]
+	}
+	logEmbedding, logEmbedErr := ai.Embed(ctx, logText)
+
+	// Step 2: fetch similar past failures and build RAG context for Claude.
+	var similarCtx string
+	if logEmbedErr == nil && len(logEmbedding) > 0 {
+		similar, err := db.SimilarFailures(ctx, logEmbedding, evt.Repo, 3)
+		if err != nil {
+			log.Printf("rag: lookup error: %v", err)
+		} else {
+			log.Printf("rag: found %d similar past failures", len(similar))
+			var sb strings.Builder
+			injected := 0
+			for i, s := range similar {
+				log.Printf("rag:   [%d] id=%d similarity=%.3f category=%s age=%s", i+1, s.ID, s.Similarity, s.Category, formatAge(s.FailedAt))
+				if s.Similarity < 0.7 {
+					log.Printf("rag:   [%d] skipped (similarity below 0.7 threshold)", i+1)
+					continue
+				}
+				if injected == 0 {
+					sb.WriteString("\n\nPast similar failures in this repo (for context):\n")
+				}
+				sb.WriteString(fmt.Sprintf("%d. [%s] category=%s confidence=%.0f%%\n   Summary: %s\n   Root cause: %s\n   Fix that worked: %s\n\n",
+					i+1, formatAge(s.FailedAt), s.Category, s.Confidence*100, s.Summary, s.RootCause, s.NextStep))
+				injected++
+			}
+			if injected > 0 {
+				similarCtx = sb.String()
+				log.Printf("rag: injected %d past failures into Claude prompt", injected)
+			} else {
+				log.Printf("rag: no past failures met the similarity threshold — diagnosing cold")
+			}
+		}
+	} else if logEmbedErr != nil {
+		log.Printf("rag: embed error: %v", logEmbedErr)
+	}
+
+	// Step 3: diagnose with RAG context appended to the log.
 	result, err := ai.Diagnose(ctx, diagnosis.Request{
 		RunID:        payload.RunID,
 		Repo:         evt.Repo,
@@ -146,7 +195,7 @@ func handlePipelineFailed(ctx context.Context, evt events.CanonicalEvent, p prov
 		CommitSHA:    payload.CommitSHA,
 		CommitMsg:    payload.CommitMsg,
 		WorkflowName: payload.WorkflowName,
-		LogContent:   rawLog.Content,
+		LogContent:   rawLog.Content + similarCtx,
 	})
 	if err != nil {
 		log.Printf("diagnosis error: %v", err)
@@ -155,7 +204,53 @@ func handlePipelineFailed(ctx context.Context, evt events.CanonicalEvent, p prov
 		return
 	}
 
-	// Build a Block Kit diagnosis card and update the placeholder.
+	// Step 4: persist failure and save the log embedding for future lookups.
+	failureID, saveErr := db.SaveFailure(ctx, store.Failure{
+		Repo:         evt.Repo,
+		Branch:       payload.Branch,
+		RunID:        payload.RunID,
+		RunURL:       payload.RunURL,
+		WorkflowName: payload.WorkflowName,
+		CommitSHA:    payload.CommitSHA,
+		CommitMsg:    payload.CommitMsg,
+		Category:     result.Category,
+		Confidence:   result.Confidence,
+		Summary:      result.Summary,
+		RootCause:    result.RootCause,
+		NextStep:     result.NextStep,
+	})
+	if saveErr != nil {
+		log.Printf("store: save failure error: %v", saveErr)
+	} else {
+		log.Printf("store: saved failure id=%d", failureID)
+
+		if logEmbedErr == nil && len(logEmbedding) > 0 {
+			if err := db.SaveEmbedding(ctx, failureID, logEmbedding); err != nil {
+				log.Printf("store: save embedding error: %v", err)
+			} else {
+				log.Printf("rag: stored log embedding for failure id=%d", failureID)
+			}
+		}
+
+		// Extract and record flaky test names from the log.
+		testNames := extractTestNames(rawLog.Content)
+		for _, name := range testNames {
+			if err := db.RecordFlakyTest(ctx, evt.Repo, name, failureID); err != nil {
+				log.Printf("store: record flaky test error: %v", err)
+			}
+		}
+
+		// Check for flaky tests and include in the card.
+		flakyTests, _ := db.FlakyTests(ctx, evt.Repo, 3, 7)
+		if len(flakyTests) > 0 {
+			var names []string
+			for _, ft := range flakyTests {
+				names = append(names, fmt.Sprintf("`%s` (%d× in 7d)", ft.TestName, ft.FailCount))
+			}
+			log.Printf("store: flaky tests detected: %s", strings.Join(names, ", "))
+		}
+	}
+
 	blocks := buildDiagnosisCard(evt, payload, result)
 	_, _, _, err = api.UpdateMessageContext(ctx, channelID, ts, slack.MsgOptionBlocks(blocks...))
 	if err != nil {
@@ -164,17 +259,62 @@ func handlePipelineFailed(ctx context.Context, evt events.CanonicalEvent, p prov
 	log.Printf("diagnosis posted for run %s: category=%s confidence=%.0f%%", payload.RunID, result.Category, result.Confidence*100)
 }
 
+// stripTimestamps removes GitHub Actions per-line timestamps so that
+// identical test output across different runs produces the same embedding.
+// GitHub Actions format: "2026-06-13T18:25:47.1234567Z <content>"
+func stripTimestamps(log string) string {
+	var sb strings.Builder
+	for _, line := range strings.Split(log, "\n") {
+		// Timestamps are exactly: YYYY-MM-DDTHH:MM:SS.fffffffZ (29 chars + space)
+		if len(line) > 30 && line[4] == '-' && line[10] == 'T' && line[19] == '.' && line[27] == 'Z' {
+			line = line[29:]
+		}
+		sb.WriteString(line)
+		sb.WriteByte('\n')
+	}
+	return sb.String()
+}
+
+// extractTestNames pulls Go test names (TestXxx) from log output.
+var testNameRe = regexp.MustCompile(`(?m)(?:FAIL|PASS):\s+(Test\w+)`)
+
+func extractTestNames(log string) []string {
+	matches := testNameRe.FindAllStringSubmatch(log, -1)
+	seen := map[string]bool{}
+	var names []string
+	for _, m := range matches {
+		if !seen[m[1]] {
+			seen[m[1]] = true
+			names = append(names, m[1])
+		}
+	}
+	return names
+}
+
+// formatAge returns a human-readable age string (e.g. "2h ago", "3d ago").
+func formatAge(t time.Time) string {
+	d := time.Since(t)
+	switch {
+	case d < time.Hour:
+		return fmt.Sprintf("%dm ago", int(d.Minutes()))
+	case d < 24*time.Hour:
+		return fmt.Sprintf("%dh ago", int(d.Hours()))
+	default:
+		return fmt.Sprintf("%dd ago", int(d.Hours()/24))
+	}
+}
+
 func buildDiagnosisCard(evt events.CanonicalEvent, payload events.PipelineFailedPayload, result diagnosis.Result) []slack.Block {
 	confidencePct := int(result.Confidence * 100)
 
 	categoryEmoji := map[string]string{
-		"code_defect":        ":bug:",
-		"test_failure":       ":test_tube:",
-		"flaky_test":         ":game_die:",
-		"dependency":         ":package:",
-		"infra_environment":  ":cloud:",
-		"config_secrets":     ":key:",
-		"timeout_resource":   ":stopwatch:",
+		"code_defect":       ":bug:",
+		"test_failure":      ":test_tube:",
+		"flaky_test":        ":game_die:",
+		"dependency":        ":package:",
+		"infra_environment": ":cloud:",
+		"config_secrets":    ":key:",
+		"timeout_resource":  ":stopwatch:",
 	}
 	emoji := categoryEmoji[result.Category]
 	if emoji == "" {
@@ -190,7 +330,7 @@ func buildDiagnosisCard(evt events.CanonicalEvent, payload events.PipelineFailed
 		slack.NewTextBlockObject("plain_text", ":red_circle: Pipeline Failed", true, false),
 	)
 
-	context := slack.NewContextBlock("", []slack.MixedElement{
+	contextBlock := slack.NewContextBlock("", []slack.MixedElement{
 		slack.NewTextBlockObject("mrkdwn",
 			fmt.Sprintf("*%s* · `%s` · `%s` — %s", evt.Repo, payload.WorkflowName, payload.Branch, payload.CommitMsg),
 			false, false),
@@ -226,7 +366,7 @@ func buildDiagnosisCard(evt events.CanonicalEvent, payload events.PipelineFailed
 
 	divider := slack.NewDividerBlock()
 
-	return []slack.Block{header, context, divider, summary, rootCause, nextStep, divider, actions}
+	return []slack.Block{header, contextBlock, divider, summary, rootCause, nextStep, divider, actions}
 }
 
 func updateSlackMessage(ctx context.Context, api *slack.Client, channel, ts, text string) {
@@ -283,6 +423,7 @@ type config struct {
 	githubWebhookSecret string
 	githubToken         string
 	aiServiceURL        string
+	databaseURL         string
 }
 
 func loadConfig() config {
@@ -296,6 +437,7 @@ func loadConfig() config {
 		githubWebhookSecret: os.Getenv("GITHUB_WEBHOOK_SECRET"),
 		githubToken:         os.Getenv("GITHUB_TOKEN"),
 		aiServiceURL:        getenv("AI_SERVICE_URL", "http://localhost:8000"),
+		databaseURL:         getenv("DATABASE_URL", "postgres://pipelinecopilot:pipelinecopilot@localhost:5432/pipelinecopilot?sslmode=disable"),
 	}
 }
 
