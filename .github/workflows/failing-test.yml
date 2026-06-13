@@ -1,0 +1,23 @@
+name: Failing Test (Demo)
+
+on:
+  push:
+    branches: ["main"]
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Run unit tests
+        run: |
+          echo "Running test suite..."
+          echo "FAIL: TestUserAuthentication (0.45s)"
+          echo "    auth_test.go:42: expected HTTP 200, got 401 Unauthorized"
+          echo "    auth_test.go:43: token validation failed: jwt: token is expired"
+          echo "FAIL: TestDatabaseConnection (1.23s)"
+          echo "    db_test.go:18: dial tcp 127.0.0.1:5432: connect: connection refused"
+          echo ""
+          echo "FAIL github.com/giridhara123/pipeline-copilot/internal/auth [build failed]"
+          exit 1
