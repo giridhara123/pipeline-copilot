@@ -26,6 +26,22 @@ type Result struct {
 	NextStep   string  `json:"next_step"`
 }
 
+type PRSummaryRequest struct {
+	PRNumber    int    `json:"pr_number"`
+	Title       string `json:"title"`
+	Author      string `json:"author"`
+	Repo        string `json:"repo"`
+	BaseBranch  string `json:"base_branch"`
+	DiffContent string `json:"diff_content"`
+}
+
+type PRSummaryResult struct {
+	Summary   string   `json:"summary"`
+	RiskLevel string   `json:"risk_level"` // low | medium | high
+	RiskFlags []string `json:"risk_flags"`
+	Checklist []string `json:"checklist"`
+}
+
 type Client struct {
 	baseURL    string
 	httpClient *http.Client
@@ -99,3 +115,34 @@ func (c *Client) Embed(ctx context.Context, text string) ([]float32, error) {
 	}
 	return result.Embedding, nil
 }
+
+// SummarizePR calls the AI service to summarise a pull request diff.
+func (c *Client) SummarizePR(ctx context.Context, req PRSummaryRequest) (PRSummaryResult, error) {
+	body, err := json.Marshal(req)
+	if err != nil {
+		return PRSummaryResult{}, err
+	}
+
+	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, c.baseURL+"/summarize-pr", bytes.NewReader(body))
+	if err != nil {
+		return PRSummaryResult{}, err
+	}
+	httpReq.Header.Set("Content-Type", "application/json")
+
+	resp, err := c.httpClient.Do(httpReq)
+	if err != nil {
+		return PRSummaryResult{}, fmt.Errorf("summarize-pr: request failed: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return PRSummaryResult{}, fmt.Errorf("summarize-pr: service returned %d", resp.StatusCode)
+	}
+
+	var result PRSummaryResult
+	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+		return PRSummaryResult{}, fmt.Errorf("summarize-pr: failed to decode response: %w", err)
+	}
+	return result, nil
+}
+// PipelineCopilot Phase 3 — real-time PR feed with AI risk analysis
