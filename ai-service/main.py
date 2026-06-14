@@ -4,15 +4,15 @@ from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 import anthropic
-from sentence_transformers import SentenceTransformer
+from fastembed import TextEmbedding
 
 load_dotenv(dotenv_path="../.env")
 
 app = FastAPI(title="PipelineCopilot AI Service")
 client = anthropic.Anthropic(api_key=os.environ["ANTHROPIC_API_KEY"])
 
-# Loaded once at startup. all-MiniLM-L6-v2 is 80MB, 384-dim, runs on CPU in ~10ms.
-_embed_model = SentenceTransformer("all-MiniLM-L6-v2")
+# fastembed uses ONNX (not PyTorch) — starts in 2-3s, 384-dim, no HuggingFace cache conflicts.
+_embed_model = TextEmbedding("BAAI/bge-small-en-v1.5")
 
 DIAGNOSE_SYSTEM = """You are PipelineCopilot, an expert CI/CD failure analyst.
 You will be given raw CI/CD log output. Analyze it and return a JSON object with exactly these fields:
@@ -83,11 +83,68 @@ class EmbedResponse(BaseModel):
 
 @app.post("/embed", response_model=EmbedResponse)
 async def embed(req: EmbedRequest):
-    # Semantic embedding via sentence-transformers (all-MiniLM-L6-v2, 384-dim).
-    # Unlike hash-based approaches, this understands that "JWT expired" and
-    # "token has expired" are the same concept → high cosine similarity.
-    vec = _embed_model.encode(req.text, normalize_embeddings=True).tolist()
+    # fastembed returns a generator — take the first (and only) result.
+    vec = list(_embed_model.embed([req.text]))[0].tolist()
     return EmbedResponse(embedding=vec, dimensions=len(vec))
+
+
+PR_SYSTEM = """You are PipelineCopilot, an expert code reviewer.
+You will be given a pull request diff and metadata. Return a JSON object with exactly these fields:
+{
+  "summary": "2-3 sentence plain-English description of what this PR does",
+  "risk_level": one of: "low" | "medium" | "high",
+  "risk_flags": ["list of specific risk concerns", "e.g. modifies auth middleware", "no tests added"],
+  "checklist": ["list of concrete review questions", "e.g. Are error responses standardized?"]
+}
+Rules:
+- risk_level is "high" if: touches auth/security, removes tests, changes DB schema, modifies CI/CD
+- risk_level is "medium" if: touches shared utilities, changes API contracts, large diff (>200 lines)
+- risk_level is "low" if: docs, small isolated changes, adds tests
+- risk_flags: 2-5 items, each one specific and actionable
+- checklist: 2-4 items as yes/no questions a reviewer should verify
+Return ONLY the JSON object. No markdown, no explanation, no code fences."""
+
+
+class PRSummaryRequest(BaseModel):
+    pr_number: int
+    title: str
+    author: str
+    repo: str
+    base_branch: str
+    diff_content: str
+
+
+class PRSummaryResponse(BaseModel):
+    summary: str
+    risk_level: str
+    risk_flags: List[str]
+    checklist: List[str]
+
+
+@app.post("/summarize-pr", response_model=PRSummaryResponse)
+async def summarize_pr(req: PRSummaryRequest):
+    # Truncate diff to stay within token budget (~12k chars)
+    diff = req.diff_content[-12000:] if len(req.diff_content) > 12000 else req.diff_content
+
+    user_msg = f"""PR #{req.pr_number}: {req.title}
+Repo: {req.repo}  |  Author: @{req.author}  |  Base: {req.base_branch}
+
+--- DIFF START ---
+{diff}
+--- DIFF END ---"""
+
+    try:
+        import json
+        message = client.messages.create(
+            model="claude-sonnet-4-6",
+            max_tokens=1024,
+            system=PR_SYSTEM,
+            messages=[{"role": "user", "content": user_msg}],
+        )
+        data = json.loads(message.content[0].text)
+        return PRSummaryResponse(**data)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
 
 
 @app.get("/health")
