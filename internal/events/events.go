@@ -51,3 +51,4 @@ type DeploymentPayload struct {
 	Environment string
 	URL         string
 }
+// v2 PR card with GitHub preview
