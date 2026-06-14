@@ -223,7 +223,57 @@ func (p *Provider) FetchLogs(ctx context.Context, runID string) (provider.RawLog
 }
 
 func (p *Provider) FetchDiff(ctx context.Context, prNumber int, repo string) (provider.Diff, error) {
-	return provider.Diff{}, fmt.Errorf("github: FetchDiff not yet implemented — coming in Phase 3")
+	parts := strings.SplitN(repo, "/", 2)
+	if len(parts) != 2 {
+		return provider.Diff{}, fmt.Errorf("github: repo must be owner/repo, got %q", repo)
+	}
+	owner, repoName := parts[0], parts[1]
+
+	// Fetch the raw diff using GitHub's diff media type.
+	url := fmt.Sprintf("https://api.github.com/repos/%s/%s/pulls/%d", owner, repoName, prNumber)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+	if err != nil {
+		return provider.Diff{}, err
+	}
+	req.Header.Set("Authorization", "Bearer "+p.token)
+	req.Header.Set("Accept", "application/vnd.github.diff")
+
+	resp, err := (&http.Client{}).Do(req)
+	if err != nil {
+		return provider.Diff{}, fmt.Errorf("github: diff request failed: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return provider.Diff{}, fmt.Errorf("github: diff fetch returned %d", resp.StatusCode)
+	}
+
+	diffBytes, err := io.ReadAll(io.LimitReader(resp.Body, 2<<20)) // 2 MB cap
+	if err != nil {
+		return provider.Diff{}, fmt.Errorf("github: reading diff: %w", err)
+	}
+
+	content := string(diffBytes)
+
+	// Count files, additions, deletions from the diff.
+	var files, additions, deletions int
+	for _, line := range strings.Split(content, "\n") {
+		switch {
+		case strings.HasPrefix(line, "diff --git"):
+			files++
+		case strings.HasPrefix(line, "+") && !strings.HasPrefix(line, "+++"):
+			additions++
+		case strings.HasPrefix(line, "-") && !strings.HasPrefix(line, "---"):
+			deletions++
+		}
+	}
+
+	return provider.Diff{
+		Content:      content,
+		FilesChanged: files,
+		Additions:    additions,
+		Deletions:    deletions,
+	}, nil
 }
 
 func (p *Provider) ListRecentCommits(ctx context.Context, repo, branch string, limit int) ([]provider.Commit, error) {

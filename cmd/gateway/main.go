@@ -73,6 +73,8 @@ func main() {
 		switch evt.Type {
 		case events.EventPipelineFailed:
 			handlePipelineFailed(ctx, evt, p, ai, db, api, cfg)
+		case events.EventPROpened:
+			handlePROpened(ctx, evt, p, ai, api, cfg)
 		default:
 			log.Printf("unhandled event type: %s", evt.Type)
 		}
@@ -369,6 +371,116 @@ func buildDiagnosisCard(evt events.CanonicalEvent, payload events.PipelineFailed
 	return []slack.Block{header, contextBlock, divider, summary, rootCause, nextStep, divider, actions}
 }
 
+func handlePROpened(ctx context.Context, evt events.CanonicalEvent, p provider.Provider, ai *diagnosis.Client, api *slack.Client, cfg config) {
+	payload, ok := evt.Payload.(events.PRPayload)
+	if !ok {
+		return
+	}
+
+	log.Printf("pr: summarising PR #%d in %s", payload.Number, evt.Repo)
+
+	diff, err := p.FetchDiff(ctx, payload.Number, evt.Repo)
+	if err != nil {
+		log.Printf("pr: fetch diff error: %v", err)
+		api.PostMessageContext(ctx, cfg.slackPRChannel, slack.MsgOptionText(
+			fmt.Sprintf(":pr: *PR #%d opened* — `%s`\n<%s|View PR> (could not fetch diff: %v)", payload.Number, payload.Title, payload.URL, err),
+			false,
+		))
+		return
+	}
+
+	result, err := ai.SummarizePR(ctx, diagnosis.PRSummaryRequest{
+		PRNumber:    payload.Number,
+		Title:       payload.Title,
+		Author:      payload.Author,
+		Repo:        evt.Repo,
+		BaseBranch:  payload.BaseBranch,
+		DiffContent: diff.Content,
+	})
+	if err != nil {
+		log.Printf("pr: summarise error: %v", err)
+		api.PostMessageContext(ctx, cfg.slackPRChannel, slack.MsgOptionText(
+			fmt.Sprintf(":pr: *PR #%d opened* — `%s` by @%s\n<%s|View PR>", payload.Number, payload.Title, payload.Author, payload.URL),
+			false,
+		))
+		return
+	}
+
+	blocks := buildPRCard(evt, payload, diff, result)
+	_, _, err = api.PostMessageContext(ctx, cfg.slackPRChannel,
+		slack.MsgOptionBlocks(blocks...),
+		slack.MsgOptionEnableLinkUnfurl(),
+	)
+	if err != nil {
+		log.Printf("pr: slack post error: %v", err)
+	}
+	log.Printf("pr: posted summary for PR #%d risk=%s files=%d +%d -%d", payload.Number, result.RiskLevel, diff.FilesChanged, diff.Additions, diff.Deletions)
+}
+
+func buildPRCard(evt events.CanonicalEvent, payload events.PRPayload, diff provider.Diff, result diagnosis.PRSummaryResult) []slack.Block {
+	riskEmoji := map[string]string{
+		"low":    ":white_check_mark:",
+		"medium": ":warning:",
+		"high":   ":red_circle:",
+	}
+	emoji := riskEmoji[result.RiskLevel]
+	if emoji == "" {
+		emoji = ":question:"
+	}
+
+	header := slack.NewHeaderBlock(
+		slack.NewTextBlockObject("plain_text", ":git-pull-request: Pull Request Opened", true, false),
+	)
+
+	// Top context: repo · branch · PR number · author · stats · View PR link
+	contextBlock := slack.NewContextBlock("", []slack.MixedElement{
+		slack.NewTextBlockObject("mrkdwn",
+			fmt.Sprintf("*%s* · `%s` → `main` · *#%d* %s · by @%s · `%d` files `+%d` `-%d` · <%s|View PR>",
+				evt.Repo, payload.BaseBranch, payload.Number, payload.Title,
+				payload.Author, diff.FilesChanged, diff.Additions, diff.Deletions, payload.URL),
+			false, false),
+	}...)
+
+	// Plain URL in a section triggers Slack's GitHub unfurl preview card.
+	urlBlock := slack.NewSectionBlock(
+		slack.NewTextBlockObject("mrkdwn", payload.URL, false, false),
+		nil, nil,
+	)
+
+	summary := slack.NewSectionBlock(
+		slack.NewTextBlockObject("mrkdwn",
+			fmt.Sprintf("*Summary*\n%s", result.Summary),
+			false, false),
+		nil, nil,
+	)
+
+	divider := slack.NewDividerBlock()
+
+	var flagLines []string
+	for _, f := range result.RiskFlags {
+		flagLines = append(flagLines, "• "+f)
+	}
+	riskBlock := slack.NewSectionBlock(
+		slack.NewTextBlockObject("mrkdwn",
+			fmt.Sprintf("*Risk* %s `%s`\n%s", emoji, result.RiskLevel, strings.Join(flagLines, "\n")),
+			false, false),
+		nil, nil,
+	)
+
+	var checkLines []string
+	for _, c := range result.Checklist {
+		checkLines = append(checkLines, "☐ "+c)
+	}
+	checkBlock := slack.NewSectionBlock(
+		slack.NewTextBlockObject("mrkdwn",
+			fmt.Sprintf("*Review Checklist*\n%s", strings.Join(checkLines, "\n")),
+			false, false),
+		nil, nil,
+	)
+
+	return []slack.Block{header, contextBlock, urlBlock, divider, summary, riskBlock, checkBlock}
+}
+
 func updateSlackMessage(ctx context.Context, api *slack.Client, channel, ts, text string) {
 	api.UpdateMessageContext(ctx, channel, ts, slack.MsgOptionText(text, false))
 }
@@ -419,6 +531,7 @@ type config struct {
 	slackAppToken       string
 	slackSigningSecret  string
 	slackChannel        string
+	slackPRChannel      string
 	webhookPort         string
 	githubWebhookSecret string
 	githubToken         string
@@ -433,6 +546,7 @@ func loadConfig() config {
 		slackAppToken:       requireenv("SLACK_APP_TOKEN"),
 		slackSigningSecret:  requireenv("SLACK_SIGNING_SECRET"),
 		slackChannel:        getenv("SLACK_CHANNEL", "general"),
+		slackPRChannel:      getenv("SLACK_PR_CHANNEL", "pr-reviews"),
 		webhookPort:         getenv("WEBHOOK_PORT", "8080"),
 		githubWebhookSecret: os.Getenv("GITHUB_WEBHOOK_SECRET"),
 		githubToken:         os.Getenv("GITHUB_TOKEN"),
